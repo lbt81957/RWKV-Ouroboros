@@ -319,93 +319,150 @@ class RWKV(nn.Module):
         return optimizer, lr_scheduler
 
 
-
-
-
-    # def forward(self, idx: torch.Tensor, last_shift_states: torch.Tensor,
-    #             last_wkv_states: torch.Tensor):
-
-    def forward(self, batch:dict, states:BlockStateList=None):
-        args = self.args
-        # pre calc
-        #
-        seq = batch['input_ids']
-        mask = batch.get('attention_mask',None)
-
-        # data process
-        idx = seq[:-1]
-        targets = seq[1:]
-        if mask == None:
-            mask = [int(x!=0) for x in idx]
-        else:
-            mask = mask[:len(idx)]
-        # data into tensor
-        idx = torch.tensor([idx],dtype=torch.long).cuda()
-        targets = torch.tensor([targets],dtype=torch.long).cuda()
-
-        # process mask
-        mask = torch.tensor([mask],dtype=torch.float32).to('cuda')
-        mask = mask.view(-1)
-        sum_mask = torch.sum(mask).item()
-
-        # idx, targets, *others = batch
-        B, T = idx.shape
-        C = args.n_embd
-
-        # 计算logits
-        args = self.args
-
+    def forward(self, idx: torch.Tensor,
+                last_shift_states: torch.Tensor = None,
+                last_wkv_states: torch.Tensor = None):
         B, T = idx.size()
-        C = args.n_embd
-        H =  args.dim_att // args.head_size_a
-
         assert T <= self.args.ctx_len, "Cannot forward, model ctx_len is exhausted."
-        assert C == H * args.head_size_a
 
         x = self.emb(idx)
-        new_states = BlockStateList.empty(args.n_layer,
-                                          B,
-                                          args.n_embd,
-                                          args.n_head,
-                                          args.head_size,
-                                          x.device,
-                                          x.dtype)
 
-        if states is None:
+        # Handle dropout (input)
+        if self.args.dropout > 0.0:
+            x = self.drop0(x)
+
+        new_states = BlockStateList.empty(self.args.n_layer, B,
+                                          self.args.n_embd,
+                                          self.args.n_head,
+                                          self.args.head_size,
+                                          x.device, x.dtype)
+
+        # last_shift_states can be None, when we are performing direct inference
+        if last_shift_states is None:
             cur_bs_list = BlockStateList.create(
-                args.n_layer,
-                B,
-                args.n_embd,
-                args.n_head,
-                args.head_size,
-                x.device,
-                x.dtype)
+                self.args.n_layer, B, self.args.n_embd,
+                self.args.n_head, self.args.head_size,
+                x.device, x.dtype
+            )
         else:
-            cur_bs_list = BlockStateList(states.shift_states, states.wkv_states)
+            cur_bs_list = BlockStateList(last_shift_states, last_wkv_states)
+
+        ## The output X token
+        output_x = x
 
         for i in range(len(self.blocks)):
             block = self.blocks[i]
             last_state = cur_bs_list[i]
             if self.args.grad_cp:
-                x, new_state = deepspeed_checkpoint(block, x, last_state)
+                output_x, new_state = deepspeed_checkpoint(
+                    block, output_x, last_state)
             else:
-                x, new_state = block(x, last_state)
+                output_x, new_state = block(output_x, last_state)
             new_states[i] = new_state
 
-        x = self.ln_out(x)
 
-        logits = self.head(x)
+        output_x = self.ln_out(output_x)
+        output_x = self.head(output_x)
 
-        #logits 计算完毕
-        # states = BlockStateList(new_shift_states, new_wkv_states)
+        return output_x, new_states.shift_states, new_states.wkv_states
 
-        if sum_mask == mask.shape[0]:
-            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
-            # print('rank', self.global_rank, 'loss', loss.item())
-        else:
-            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), reduction='none')
-            # loss_raw = loss
-            loss = torch.sum(loss * mask)
-            if sum_mask > 0:
-                loss = loss/sum_mask
-        return L2Wrap.apply(loss, logits, torch.sum(mask), mask), new_states
+
+
+
+    def compute_loss(self, batch,model_engine=None,
+                      states=None, ctx_len=2048,optimizer=None):
+        args = self.args
+        # pre calc
+        seq = batch['input_ids']
+        ori_seq_mask = batch.get('attention_mask',None)
+
+        # data process
+        idx = seq[:-1]
+        targets = seq[1:]
+
+        # data into tensor
+        idx = torch.tensor([idx],dtype=torch.long).cuda()
+        targets = torch.tensor([targets],dtype=torch.long).cuda()
+        if ori_seq_mask == None or ori_seq_mask.ndim != 2:
+            ori_seq_mask = torch.ones_like(idx)
+
+        B, T = idx.shape
+        C = self.args.n_embd
+
+        seq_mask = ori_seq_mask
+        # process mask
+        total_mask_sum = torch.sum(seq_mask)
+        if total_mask_sum == 0:
+            return 0
+
+        if states is None:
+            states = BlockStateList.create(
+                self.args.n_layer, B, self.args.n_embd,
+                self.args.n_head, self.args.head_size,
+                idx.device, self.emb.weight.dtype)
+
+
+        def checkpointed_step(idx, targets, mask, prev_loss, last_shift_states,
+                              last_wkv_states, prev_steps):
+            logits, new_shift_states, new_wkv_states = self(
+                idx, last_shift_states, last_wkv_states)
+
+            # Ensure logits, targets, and mask are contiguous
+            # this is required to avoid view is not compatible with size and stride error
+            logits = logits.contiguous()
+            targets = targets.contiguous()
+            mask = mask.contiguous()
+
+            loss = F.cross_entropy(logits.view(-1, logits.size(-1)),
+                                    targets.view(-1),
+                                    reduction="none")
+
+            submask = mask.view(-1)[:loss.shape[0]]
+            submask_sum = torch.sum(submask)
+            loss = torch.sum(loss * submask) / total_mask_sum
+
+            loss = L2Wrap.apply(loss, logits, total_mask_sum, submask)
+            new_steps = prev_steps + submask_sum
+            new_loss = prev_loss + loss
+            return new_loss, new_shift_states, new_wkv_states, new_steps
+
+        steps = 0
+        total_loss = torch.tensor(0, dtype=self.emb.weight.dtype).requires_grad_()
+        segment_count = math.ceil(T / ctx_len)
+        segment_size = min(math.ceil(T / segment_count)+1, ctx_len)
+        forward_segment_count = segment_count
+        backward_segment_count = forward_segment_count
+        start_learning_segment = 0
+        cur_device = idx.device
+        segment_loss = torch.tensor(0, dtype=self.emb.weight.dtype).requires_grad_()
+        for i in range(forward_segment_count):
+            prv_shift_states = states.shift_states
+            prv_wkv_states = states.wkv_states
+            cur_idx = idx[:, i * segment_size:(i + 1) * segment_size]
+            cur_tar = targets[:, i * segment_size:(i + 1) * segment_size]
+            cur_msk = seq_mask[:, i * segment_size:(i + 1) * segment_size]
+            segment_loss, new_shift_states, new_wkv_states, steps = checkpointed_step(
+                cur_idx,
+                cur_tar,
+                cur_msk,
+                torch.tensor(0, dtype=self.emb.weight.dtype).requires_grad_(True),
+                prv_shift_states,
+                prv_wkv_states,
+                steps,)
+
+            states = BlockStateList(new_shift_states, new_wkv_states)
+            if i >= start_learning_segment and i < start_learning_segment + backward_segment_count:
+                learning_loss = segment_loss
+                if i == start_learning_segment + backward_segment_count - 1:
+                    total_loss = total_loss + segment_loss
+                else:
+                    print(f"==={ctx_len}===={segment_count}=")
+                    print("===",learning_loss)
+                    model_engine.backward(learning_loss, retain_graph=True)
+                    optimizer.step()
+                    total_loss = total_loss + segment_loss.clone().detach().requires_grad_(False)
+            else:
+                total_loss = total_loss + segment_loss.clone().detach().requires_grad_(False)
+
+        assert not torch.isnan(total_loss), "total_loss is NaN"
+        return total_loss, states

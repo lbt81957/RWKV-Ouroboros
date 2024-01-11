@@ -274,6 +274,106 @@ class RWKV_RNN(MyModule):
             return x.float(), state
 
     def generate(self,
+                 message,
+                 inference_config,
+                 callback=print,
+                 state=None,
+                 pos_state=None,
+                 neg_state=None,
+                 pos_gama=0.4,
+                 neg_gama=0.4,
+                 pos_logits=None,
+                 neg_logits=None):
+
+        tokens, masks = message.tokens()
+
+        if False:
+            print("===1==", tokens)
+            print("===2==", message.text)
+            print("===3==", message.tokenizer().decode(tokens))
+
+        pos, neg = message.cfg_tokens()
+
+        # add pos or neg tag
+        if len(pos) > 0:
+            pos_tag = True
+        else:
+            pos_tag = False
+
+        if len(neg) > 0:
+            neg_tag = True
+            neg_gama = -1 * neg_gama
+        else:
+            neg_tag = False
+        token_count = inference_config['token_count']
+        token_ban = inference_config['token_ban']
+        token_stop = inference_config['token_stop']
+        temperature =  inference_config['temperature']
+        top_p = inference_config['top_p']
+        alpha_presence = inference_config['alpha_presence']
+        alpha_frequency = inference_config['alpha_frequency']
+        alpha_decay = inference_config['alpha_decay']
+        out_str = ""
+        occurrence = {}
+        all_tokens = []
+        out_last = 0
+        for i in range(0,token_count):
+            if i == 0:
+                while len(tokens) > 0:
+                    do_infer = tokens[:512]
+                    tokens = tokens[512:]
+                    logits, state = self.forward(do_infer, state)
+                if pos_tag:
+                    while len(pos) > 0:
+                        do_infer = pos[:512]
+                        pos = pos[512:]
+                        pos_logits, pos_state = self.forward(do_infer, pos_state)
+                if neg_tag :
+                    while len(neg) > 0:
+                        do_infer = neg[:512]
+                        neg = neg[512:]
+                        neg_logits, neg_state = self.forward(do_infer, neg_state)
+            else:
+                logits, state = self.forward([token], state)
+                if pos_tag:
+                    pos_logits, pos_state = self.forward([token], pos_state)
+                if neg_tag:
+                    neg_logits, neg_state = self.forward([token], neg_state)
+
+            if pos_tag:
+                logits = pos_logits * pos_gama + logits * (1 - pos_gama)
+            if neg_tag:
+                logits = neg_logits * neg_gama + logits * (1 - neg_gama)
+
+            for n in token_ban:
+                logits[n] = -float('inf')
+            for n in occurrence:
+                logits[n] -= (alpha_presence + occurrence[n] * alpha_frequency)
+
+            token = sample_logits(logits,
+                                  temperature=temperature,
+                                  top_p=top_p)
+            if token in token_stop:
+                break
+            all_tokens += [token]
+            for xxx in occurrence:
+                occurrence[xxx] *= alpha_decay
+            if token not in occurrence:
+                occurrence[token] = 1
+            else:
+                occurrence[token] += 1
+            text = message.tokenizer().decode(all_tokens[out_last:])
+            if '\ufffd' not in text: # only print when we have a valid utf-8 string
+                print(text, end="", flush=True)
+                out_str += text
+                out_last = i + 1
+
+        message.generated = True
+        message.response = out_str
+        return message, state, pos_state, neg_state
+
+    # 流式输出
+    def flow_generate(self,
                  tokenizer,
                  message,
                  inference_config,
@@ -316,11 +416,11 @@ class RWKV_RNN(MyModule):
             else:
                 occurrence[token] += 1
             text = tokenizer.decode(all_tokens[out_last:])
+            logits, state = self.forward([token], state)
             if '\ufffd' not in text: # only print when we have a valid utf-8 string
                 print(text, end="", flush=True)
-                out_str += text
+                if text:
+                    # 流式输出
+                    yield text
                 out_last = i + 1
-            logits, state = self.forward([token], state)
-        message.generated = True
-        message.response = out_str
-        return message, state
+        return state
